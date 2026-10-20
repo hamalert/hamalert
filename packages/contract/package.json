@@ -1,0 +1,18 @@
+{
+  "name": "@hamalert/contract",
+  "version": "0.4.4",
+  "private": true,
+  "description": "OpenAPI contract shared by the HamAlert API and its clients.",
+  "types": "./src/schema.ts",
+  "files": [
+    "openapi.yaml",
+    "spot-model.yaml",
+    "src/schema.ts"
+  ],
+  "scripts": {
+    "gen-types": "openapi-typescript openapi.yaml -o src/schema.ts"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.6.1"
+  }
+}

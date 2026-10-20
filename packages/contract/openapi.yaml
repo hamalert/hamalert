@@ -1,0 +1,1453 @@
+openapi: 3.1.0
+info:
+  title: HamAlert API
+  version: 0.4.4
+  summary: Contract between the HamAlert backend and its web and mobile clients.
+  description: |
+    Draft 1, 2026-10-15. Derived from spot-model.md and the source research in research/. Spot and MatchedSpot
+    schemas live in spot-model.yaml and are referenced from here.
+
+    Conventions
+    - Base path `/v1`. Bearer tokens (opaque, one session per device). Errors are RFC 9457
+      `application/problem+json`. Times are RFC 3339 UTC. Frequencies are integer Hz.
+    - Lists are cursor-paginated: pass `cursor` from the previous page's `nextCursor`.
+    - Reference data responses carry `ETag`; send `If-None-Match` and expect `304`.
+    - Enum-like string fields that sources can extend (`mode`, `source`, provenance values) are
+      open strings; clients must tolerate unknown values and treat unknown provenance as "not reported".
+    - Values a feed did not report are marked in `provenance` (see spot-model.yaml); it is informational.
+    - Scope is the alerting product as it exists: no planned events, no satellites, no webhook GET or form
+      encoding, no forum single sign-on in this contract.
+  license:
+    name: MIT
+    url: https://opensource.org/license/mit
+servers:
+  - url: https://api.hamalert.org/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Auth
+    description: Sessions, registration and password recovery
+  - name: Account
+    description: The account itself, email and Club Log link
+  - name: Destinations
+    description: 'Where alerts go: app templates, Telnet, webhook, Threema'
+  - name: Devices
+    description: Push-registered devices
+  - name: Limits
+    description: Alert rate limits and blocked spotters
+  - name: Triggers
+    description: Alert rules
+  - name: Mutes
+    description: Temporary silencing of a callsign
+  - name: Spots
+    description: Matched spot history and live stream
+  - name: Simulate
+    description: "Test a spot against the account's triggers"
+  - name: Reference
+    description: Shared reference data (ETag cached)
+  - name: Public
+    description: Unauthenticated endpoints
+
+paths:
+  # ---------------------------------------------------------------- Auth
+  /auth/login:
+    post:
+      operationId: postAuthLogin
+      tags: [Auth]
+      summary: Log in and open a session for this device
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: {type: string, description: "Callsign-style username, case-insensitive"}
+                password: {type: string, format: password}
+                device:
+                  $ref: '#/components/schemas/DeviceDescriptor'
+      responses:
+        '200':
+          description: Session opened
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenPair'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+  /auth/refresh:
+    post:
+      operationId: postAuthRefresh
+      tags: [Auth]
+      summary: Exchange a refresh token for a new token pair
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: {type: string}
+      responses:
+        '200':
+          description: New token pair; the old refresh token is revoked
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenPair'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /auth/logout:
+    post:
+      operationId: postAuthLogout
+      tags: [Auth]
+      summary: Revoke the current session and its device's push token
+      responses:
+        '204': {description: "Session revoked"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /auth/sessions:
+    get:
+      operationId: getAuthSessions
+      tags: [Auth]
+      summary: List the account's open sessions
+      responses:
+        '200':
+          description: Sessions
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Session'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /auth/sessions/{sessionId}:
+    delete:
+      operationId: deleteAuthSessionsSessionId
+      tags: [Auth]
+      summary: Revoke another session
+      parameters:
+        - {name: sessionId, in: path, required: true, schema: {type: string}}
+      responses:
+        '204': {description: "Revoked"}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /auth/register/captcha:
+    get:
+      operationId: getAuthRegisterCaptcha
+      tags: [Auth]
+      summary: Configuration for the registration and password-reset CAPTCHA widget
+      description: |
+        Before loading `scriptUrl`, set `window.CAP_CUSTOM_WASM_URL` to `wasmUrl` and
+        `window.CAP_CUSTOM_HASHWX_URL` to `hashwxUrl`. Then render
+        `<cap-widget data-cap-api-endpoint="apiEndpoint">`.
+        Submit the token from the widget's `solve` event as `captchaToken` on
+        registration and on password reset.
+        The server checks it with the Cap Standalone instance at `{apiEndpoint}siteverify`.
+        The widget, the solver WASM, and HashWX are served by that instance's asset server.
+      security: []
+      responses:
+        '200':
+          description: Widget configuration. The site key is public.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RegistrationCaptcha'}
+        '503':
+          description: CAPTCHA provider is not configured
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/Problem'}
+  /auth/register:
+    post:
+      operationId: postAuthRegister
+      tags: [Auth]
+      summary: Start registration; a confirmation email is sent
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, username, password, captchaToken]
+              properties:
+                email: {type: string, format: email}
+                username: {type: string, pattern: '^[A-Za-z0-9-]{3,16}$', description: "Usually the callsign"}
+                password: {type: string, format: password, minLength: 8}
+                captchaToken: {type: string, description: "Token from the Cap widget's solve event (the cap-token field). The server checks it with Cap; it is not a shared answer."}
+      responses:
+        '202': {description: "Confirmation email sent (also returned when the address is already registered)"}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {description: "Username taken", content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+  /auth/register/confirm:
+    post:
+      operationId: postAuthRegisterConfirm
+      tags: [Auth]
+      summary: Confirm registration with the emailed token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties: {token: {type: string}}
+      responses:
+        '201':
+          description: Account created and session opened
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TokenPair'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /auth/password/forgot:
+    post:
+      operationId: postAuthPasswordForgot
+      tags: [Auth]
+      summary: Request a password reset email
+      description: |
+        Load the widget from `GET /auth/register/captcha` and send its solve token as `captchaToken`.
+        The token is checked before the account lookup. The response is 202 whether or not the account exists.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [usernameOrEmail, captchaToken]
+              properties:
+                usernameOrEmail: {type: string}
+                captchaToken: {type: string, description: "Token from the Cap widget's solve event (the cap-token field)."}
+      responses:
+        '202': {description: "Email sent if the account exists"}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /auth/password/reset:
+    post:
+      operationId: postAuthPasswordReset
+      tags: [Auth]
+      summary: Set a new password with the emailed token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: {type: string}
+                password: {type: string, format: password, minLength: 8}
+      responses:
+        '204': {description: "Password changed; all sessions revoked"}
+        '400': {$ref: '#/components/responses/BadRequest'}
+
+  # ---------------------------------------------------------------- Account
+  /account:
+    get:
+      operationId: getAccount
+      tags: [Account]
+      summary: The authenticated account
+      responses:
+        '200':
+          description: Account
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Account'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    patch:
+      operationId: patchAccount
+      tags: [Account]
+      summary: Change the username or pause alerts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: {type: string, pattern: '^[A-Za-z0-9-]{3,16}$'}
+                alertsEnabled: {type: boolean}
+      responses:
+        '200':
+          description: Updated account; sessions stay valid
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Account'}
+        '409': {description: "Username taken", content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+    delete:
+      operationId: deleteAccount
+      tags: [Account]
+      summary: Delete the account and everything it owns
+      responses:
+        '204': {description: "Deleted"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /account/password:
+    put:
+      operationId: putAccountPassword
+      tags: [Account]
+      summary: Change the password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: {type: string, format: password}
+                newPassword: {type: string, format: password, minLength: 8}
+      responses:
+        '204': {description: "Changed; other sessions revoked"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /account/email:
+    post:
+      operationId: postAccountEmail
+      tags: [Account]
+      summary: Request an account email change; a confirmation is sent to the new address
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties: {email: {type: string, format: email}}
+      responses:
+        '202': {description: "Confirmation email sent"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /account/email/confirm:
+    post:
+      operationId: postAccountEmailConfirm
+      tags: [Account]
+      summary: Confirm the email change
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties: {token: {type: string}}
+      responses:
+        '204': {description: "Email changed"}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /account/clublog:
+    put:
+      operationId: putAccountClublog
+      tags: [Account]
+      summary: Link a Club Log account (application password)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, appPassword]
+              properties:
+                email: {type: string, format: email}
+                appPassword: {type: string, format: password}
+      responses:
+        '204': {description: "Stored; the `invalid` flag resets"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    delete:
+      operationId: deleteAccountClublog
+      tags: [Account]
+      summary: Unlink Club Log
+      responses:
+        '204': {description: "Unlinked"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  # ---------------------------------------------------------------- Destinations
+  /account/destinations:
+    get:
+      operationId: getAccountDestinations
+      tags: [Destinations]
+      summary: Alert destinations
+      responses:
+        '200':
+          description: Destinations
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Destinations'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    patch:
+      operationId: patchAccountDestinations
+      tags: [Destinations]
+      summary: Update destinations (merge; null clears a field)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DestinationsPatch'}
+      responses:
+        '200':
+          description: Updated. Setting a new `threema.id` sends a verification code and leaves `threema.verified` false until /account/destinations/threema/verify succeeds. Verification messages are limited to 5 per hour for the account and 5 per hour for that Threema id.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Destinations'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+  /account/destinations/threema/verify:
+    post:
+      operationId: postAccountDestinationsThreemaVerify
+      tags: [Destinations]
+      summary: Verify the Threema id with the code received in Threema
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  minLength: 10
+                  maxLength: 24
+                  description: "Same code the website sends in Threema: 10 Crockford base32 characters, shown as XXXXX-XXXXX. Hyphens and spaces are ignored."
+      responses:
+        '204': {description: "Verified"}
+        '400': {$ref: '#/components/responses/BadRequest'}
+
+  # ---------------------------------------------------------------- Devices
+  /devices:
+    get:
+      operationId: getDevices
+      tags: [Devices]
+      summary: Devices registered for push
+      responses:
+        '200':
+          description: Devices
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Device'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    post:
+      operationId: postDevices
+      tags: [Devices]
+      summary: Register this session's device for push (idempotent on pushToken)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DeviceRegistration'}
+      responses:
+        '200':
+          description: Device (created or updated)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Device'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /devices/{deviceId}:
+    parameters:
+      - {name: deviceId, in: path, required: true, schema: {type: string}}
+    patch:
+      operationId: patchDevicesDeviceId
+      tags: [Devices]
+      summary: Change a device's push settings or name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: {type: string, maxLength: 64}
+                pushEnabled: {type: boolean}
+                sound: {$ref: '#/components/schemas/PushSound'}
+      responses:
+        '200':
+          description: Device
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Device'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    delete:
+      operationId: deleteDevicesDeviceId
+      tags: [Devices]
+      summary: Remove a device; it stops receiving push
+      responses:
+        '204': {description: "Removed"}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  # ---------------------------------------------------------------- Limits
+  /account/limits:
+    get:
+      operationId: getAccountLimits
+      tags: [Limits]
+      summary: Rate limits and the exceeded counter
+      responses:
+        '200':
+          description: Limits
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Limits'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    put:
+      operationId: putAccountLimits
+      tags: [Limits]
+      summary: Replace the rate limits
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LimitsInput'}
+      responses:
+        '200':
+          description: Limits
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Limits'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /account/limits/exceeded/reset:
+    post:
+      operationId: postAccountLimitsExceededReset
+      tags: [Limits]
+      summary: Reset the exceeded counter
+      responses:
+        '204': {description: "Reset"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /account/blocked-spotters:
+    get:
+      operationId: getAccountBlockedSpotters
+      tags: [Limits]
+      summary: Spotters excluded from every trigger
+      responses:
+        '200':
+          description: Callsigns
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: './spot-model.yaml#/components/schemas/Callsign'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    put:
+      operationId: putAccountBlockedSpotters
+      tags: [Limits]
+      summary: Replace the blocked spotter list
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: array, maxItems: 5000, items: {$ref: './spot-model.yaml#/components/schemas/Callsign'}}
+      responses:
+        '200':
+          description: Callsigns
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: './spot-model.yaml#/components/schemas/Callsign'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  # ---------------------------------------------------------------- Triggers
+  /triggers:
+    get:
+      operationId: getTriggers
+      tags: [Triggers]
+      summary: All triggers of the account
+      responses:
+        '200':
+          description: Triggers
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Trigger'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    post:
+      operationId: postTriggers
+      tags: [Triggers]
+      summary: Create a trigger
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TriggerInput'}
+      responses:
+        '201':
+          description: Created. Takes effect within the matcher's reload latency (seconds).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Trigger'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {description: "Trigger limit reached (100)", content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+  /triggers/{triggerId}:
+    parameters:
+      - {name: triggerId, in: path, required: true, schema: {type: string}}
+    get:
+      operationId: getTriggersTriggerId
+      tags: [Triggers]
+      summary: One trigger
+      responses:
+        '200':
+          description: Trigger
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Trigger'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    put:
+      operationId: putTriggersTriggerId
+      tags: [Triggers]
+      summary: Replace a trigger (resets matchCount and clears autoDisabled)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TriggerInput'}
+      responses:
+        '200':
+          description: Trigger
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Trigger'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    delete:
+      operationId: deleteTriggersTriggerId
+      tags: [Triggers]
+      summary: Delete a trigger
+      responses:
+        '204': {description: "Deleted"}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /triggers/{triggerId}/enabled:
+    put:
+      operationId: putTriggersTriggerIdEnabled
+      tags: [Triggers]
+      summary: Enable or disable without editing
+      parameters:
+        - {name: triggerId, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties: {enabled: {type: boolean}}
+      responses:
+        '200':
+          description: Trigger
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Trigger'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /triggers/helpers/clublog-unworked-dxcc:
+    post:
+      operationId: postTriggersHelpersClublogUnworkedDxcc
+      tags: [Triggers]
+      summary: DXCC entities the linked Club Log account has not worked, for a DXCC condition
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callsign]
+              properties:
+                callsign: {$ref: './spot-model.yaml#/components/schemas/Callsign'}
+                modes: {type: string, enum: [all, cw, phone, data], default: all}
+                status: {type: array, items: {type: string, enum: [worked, confirmed, verified]}, default: [worked, confirmed, verified]}
+                dateFilter: {type: string, enum: [all, last12months, thisYear, lastYear], default: all}
+      responses:
+        '200':
+          description: Entity numbers
+          content:
+            application/json:
+              schema: {type: object, required: [dxcc], properties: {dxcc: {type: array, items: {type: integer}}}}
+        '409': {description: "Club Log not linked or credentials invalid", content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+  /triggers/helpers/sota-complete-candidates:
+    get:
+      operationId: getTriggersHelpersSotaCompleteCandidates
+      tags: [Triggers]
+      summary: Summits the account's callsign has activated but not chased, for a summit list condition
+      responses:
+        '200':
+          description: Summit references
+          content:
+            application/json:
+              schema: {type: object, required: [summitRefs], properties: {summitRefs: {type: array, items: {$ref: './spot-model.yaml#/components/schemas/SummitCode'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  # ---------------------------------------------------------------- Mutes
+  /mutes:
+    get:
+      operationId: getMutes
+      tags: [Mutes]
+      summary: Active mutes
+      responses:
+        '200':
+          description: Mutes
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Mute'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    post:
+      operationId: postMutes
+      tags: [Mutes]
+      summary: Mute a callsign, optionally narrowed to band, mode or summit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MuteInput'}
+      responses:
+        '201':
+          description: Mute (an identical mute is extended, not duplicated)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Mute'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    delete:
+      operationId: deleteMutes
+      tags: [Mutes]
+      summary: Clear all mutes
+      responses:
+        '204': {description: "Cleared"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /mutes/{muteId}:
+    delete:
+      operationId: deleteMutesMuteId
+      tags: [Mutes]
+      summary: Remove one mute
+      parameters:
+        - {name: muteId, in: path, required: true, schema: {type: string}}
+      responses:
+        '204': {description: "Removed"}
+        '404': {$ref: '#/components/responses/NotFound'}
+
+  # ---------------------------------------------------------------- Spots
+  /spots:
+    get:
+      operationId: getSpots
+      tags: [Spots]
+      summary: Matched spots, newest first
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+        - {name: maxAge, in: query, description: "Seconds; default and maximum 86400", schema: {type: integer, minimum: 60, maximum: 86400, default: 86400}}
+        - {name: cursor, in: query, schema: {type: string}}
+        - {name: action, in: query, description: "Only spots that were delivered to this action", schema: {$ref: './spot-model.yaml#/components/schemas/Action'}}
+      responses:
+        '200':
+          description: Page of matched spots
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items: {type: array, items: {$ref: './spot-model.yaml#/components/schemas/MatchedSpot'}}
+                  nextCursor: {type: string}
+                  hasAnyAppTrigger: {type: boolean, description: "Present when items is empty, so the client can explain why"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    delete:
+      operationId: deleteSpots
+      tags: [Spots]
+      summary: Delete all matched spots
+      responses:
+        '204': {description: "Deleted"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /spots/{matchedSpotId}:
+    delete:
+      operationId: deleteSpotsMatchedSpotId
+      tags: [Spots]
+      summary: Delete one matched spot
+      parameters:
+        - {name: matchedSpotId, in: path, required: true, schema: {type: string}}
+      responses:
+        '204': {description: "Deleted"}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /spots/badge:
+    put:
+      operationId: putSpotsBadge
+      tags: [Spots]
+      summary: Set the unread badge count (clients set 0 after showing the list)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [count], properties: {count: {type: integer, minimum: 0}}}
+      responses:
+        '204': {description: "Set"}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /spots/stream:
+    get:
+      operationId: getSpotsStream
+      tags: [Spots]
+      summary: Live matched spots as server-sent events
+      description: |
+        `text/event-stream`. Each event is `event: spot`, `id: <matchedSpotId>`, `data: <MatchedSpot JSON>`.
+        Send `Last-Event-ID` (or `?since=<matchedSpotId>`) to resume; events from the last 24 h are replayable.
+        A `event: ping` comment line is sent every 30 s. The token may be passed as `?access_token=` for
+        EventSource clients that cannot set headers.
+      parameters:
+        - {name: since, in: query, schema: {type: string}}
+        - {name: Last-Event-ID, in: header, schema: {type: string}}
+      responses:
+        '200':
+          description: Event stream
+          content:
+            text/event-stream:
+              schema: {type: string}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  # ---------------------------------------------------------------- Simulate
+  /simulate:
+    post:
+      operationId: postSimulate
+      tags: [Simulate]
+      summary: Run a spot through enrichment and matching for this account only
+      description: Alerts for matching triggers are sent as if the spot were real. Limits and mutes do not apply. The response says which triggers matched and why none did.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SimulatedSpot'}
+      responses:
+        '200':
+          description: Result
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SimulateResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+
+  # ---------------------------------------------------------------- Reference
+  /reference/vocabularies:
+    get:
+      operationId: getReferenceVocabularies
+      tags: [Reference]
+      summary: Closed and open vocabularies the editor needs
+      security: []
+      responses:
+        '200':
+          description: Vocabularies
+          headers: {ETag: {schema: {type: string}}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Vocabularies'}
+        '304': {description: "Not modified"}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /reference/dxcc:
+    get:
+      operationId: getReferenceDxcc
+      tags: [Reference]
+      summary: DXCC entities
+      security: []
+      responses:
+        '200':
+          description: Entities
+          headers: {ETag: {schema: {type: string}}}
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/EntityInfo'}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /reference/sota/associations:
+    get:
+      operationId: getReferenceSotaAssociations
+      tags: [Reference]
+      summary: SOTA associations with their regions
+      security: []
+      responses:
+        '200':
+          description: Associations
+          headers: {ETag: {schema: {type: string}}}
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/SotaAssociation'}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /reference/sota/summits:
+    get:
+      operationId: getReferenceSotaSummits
+      tags: [Reference]
+      summary: Summits of a region, or a search
+      security: []
+      parameters:
+        - {name: association, in: query, schema: {type: string}}
+        - {name: region, in: query, schema: {type: string}}
+        - {name: q, in: query, description: "Code prefix or name fragment", schema: {type: string, minLength: 2}}
+        - {name: includeInvalid, in: query, schema: {type: boolean, default: false}}
+      responses:
+        '200':
+          description: Summits
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Summit'}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /reference/parks/programs:
+    get:
+      operationId: getReferenceParksPrograms
+      tags: [Reference]
+      summary: Park programmes and their prefixes (POTA programmes, WWFF divisions)
+      security: []
+      responses:
+        '200':
+          description: Programmes
+          headers: {ETag: {schema: {type: string}}}
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/ParkProgram'}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /reference/parks:
+    get:
+      operationId: getReferenceParks
+      tags: [Reference]
+      summary: Parks by prefix, or a search
+      security: []
+      parameters:
+        - {name: program, in: query, schema: {type: string, enum: [pota, wwff]}}
+        - {name: prefix, in: query, schema: {type: string}}
+        - {name: location, in: query, description: 'Location code such as US-CA', schema: {type: string}}
+        - {name: q, in: query, schema: {type: string, minLength: 2}}
+        - {name: includeInactive, in: query, schema: {type: boolean, default: false}}
+      responses:
+        '200':
+          description: Parks
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Park'}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /reference/iota:
+    get:
+      operationId: getReferenceIota
+      tags: [Reference]
+      summary: IOTA groups
+      security: []
+      responses:
+        '200':
+          description: Groups
+          headers: {ETag: {schema: {type: string}}}
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/IotaGroup'}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  # ---------------------------------------------------------------- Public
+  /public/stats:
+    get:
+      operationId: getPublicStats
+      tags: [Public]
+      summary: Spots processed and alerts sent per day
+      security: []
+      parameters:
+        - {name: days, in: query, schema: {type: integer, minimum: 1, maximum: 400, default: 30}}
+      responses:
+        '200':
+          description: Daily statistics
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Stats'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+  /public/lastspot/{callsign}:
+    get:
+      operationId: getPublicLastspotCallsign
+      tags: [Public]
+      summary: The most recent spot of a callsign within 7 days
+      security: []
+      parameters:
+        - {name: callsign, in: path, required: true, schema: {$ref: './spot-model.yaml#/components/schemas/Callsign'}}
+      responses:
+        '200':
+          description: Spot
+          content:
+            application/json:
+              schema: {$ref: './spot-model.yaml#/components/schemas/Spot'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /public/myspot/{callsign}.png:
+    get:
+      operationId: getPublicMyspotCallsignPng
+      tags: [Public]
+      summary: MySpot image for embedding
+      security: []
+      parameters:
+        - {name: callsign, in: path, required: true, schema: {$ref: './spot-model.yaml#/components/schemas/Callsign'}}
+        - {name: h, in: query, required: true, description: "HMAC shown on the account page", schema: {type: string}}
+        - {name: hours, in: query, schema: {type: integer, minimum: 1, default: 1}}
+        - {name: dark, in: query, schema: {type: boolean, default: false}}
+        - {name: scale, in: query, schema: {type: integer, enum: [1, 2], default: 1}}
+      responses:
+        '200': {description: "PNG", content: {image/png: {schema: {type: string, format: binary}}}}
+        '403': {description: "Bad HMAC"}
+  /health:
+    get:
+      operationId: getHealth
+      tags: [Public]
+      summary: Liveness and per-source feed health
+      security: []
+      responses:
+        '200':
+          description: Health
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, sources]
+                properties:
+                  status: {type: string, enum: [ok, degraded]}
+                  sources:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        lastSpotAt: {type: string, format: date-time}
+                        status: {type: string, enum: [ok, stale, down]}
+        '400': {$ref: '#/components/responses/BadRequest'}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Opaque session token from /auth/login or /auth/refresh. One session per device.
+
+  responses:
+    BadRequest:
+      description: Validation failed; `errors[]` names the fields
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    Unauthorized:
+      description: Missing, expired or revoked token, or wrong credentials
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    NotFound:
+      description: No such resource in this account
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+    TooManyRequests:
+      description: Rate limited; `Retry-After` is set
+      headers: {Retry-After: {schema: {type: integer}}}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type: {type: string, format: uri, description: 'e.g. https://hamalert.org/problems/validation'}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field: {type: string, description: "JSON pointer into the request body"}
+              message: {type: string}
+    BandOrGroup:
+      oneOf:
+        - $ref: './spot-model.yaml#/components/schemas/Band'
+        - type: string
+          enum: [vlf, lf, mf, hf, vhf, uhf, shf, ehf]
+          description: Band group; expands to the bands in /reference/vocabularies
+    IntRange:
+      type: object
+      description: Inclusive range; either bound may be omitted
+      properties:
+        from: {type: integer}
+        to: {type: integer}
+    TimeOfDayRange:
+      type: object
+      description: UTC wall clock, inclusive; from > to wraps midnight
+      required: [from, to]
+      properties:
+        from: {type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$'}
+        to: {type: string, pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$'}
+
+    # ---------------------------------------------------------- auth
+    DeviceDescriptor:
+      type: object
+      required: [platform]
+      properties:
+        platform: {type: string, enum: [ios, android, web]}
+        name: {type: string, maxLength: 64, description: 'e.g. "Pixel 9" or "Firefox on Linux"'}
+        appVersion: {type: string}
+    TokenPair:
+      type: object
+      required: [accessToken, refreshToken, expiresIn, sessionId]
+      properties:
+        accessToken: {type: string}
+        refreshToken: {type: string}
+        expiresIn: {type: integer, description: "Access token lifetime in seconds"}
+        sessionId: {type: string}
+    Session:
+      type: object
+      required: [id, createdAt, lastUsedAt, current]
+      properties:
+        id: {type: string}
+        device: {$ref: '#/components/schemas/DeviceDescriptor'}
+        createdAt: {type: string, format: date-time}
+        lastUsedAt: {type: string, format: date-time}
+        current: {type: boolean}
+
+    # ---------------------------------------------------------- account
+    Account:
+      type: object
+      required: [id, username, email, createdAt, alertsEnabled, triggerCount, maxTriggers]
+      properties:
+        id: {type: string}
+        username: {type: string}
+        alertsEnabled: {type: boolean, description: "Master switch. false pauses every delivery (push, Telnet, webhook, Threema) while triggers stay intact"}
+        email: {type: string, format: email}
+        createdAt: {type: string, format: date-time}
+        triggerCount: {type: integer}
+        maxTriggers: {type: integer}
+        clublog:
+          type: object
+          required: [linked]
+          properties:
+            linked: {type: boolean}
+            email: {type: string, format: email}
+            invalid: {type: boolean, description: "Last Club Log call failed authentication"}
+        myspot:
+          type: object
+          required: [hmac]
+          properties:
+            hmac: {type: string, description: "Query token for /public/myspot"}
+
+    # ---------------------------------------------------------- destinations
+    Destinations:
+      type: object
+      required: [app, telnet, url, threema]
+      properties:
+        app:
+          type: object
+          required: [titleTemplate, bodyTemplate]
+          properties:
+            titleTemplate: {type: string, description: 'Mustache-style, fields of Spot plus {{triggerComment}}'}
+            bodyTemplate: {type: string}
+        telnet:
+          type: object
+          required: [enabled]
+          properties:
+            enabled: {type: boolean}
+            password: {type: string, writeOnly: true}
+            passwordSet: {type: boolean, readOnly: true}
+        url:
+          type: object
+          required: [enabled]
+          description: |
+            Each matched spot is POSTed as `application/json` with body `MatchedSpot`. Headers:
+            `X-HamAlert-Signature: sha256=<hex HMAC of the body with secret>`, `X-HamAlert-Delivery: <matchedSpotId>`.
+            Non-2xx responses are retried twice; a destination that fails for 24 h is disabled and `lastError` set.
+          properties:
+            enabled: {type: boolean}
+            url: {type: string, format: uri, description: "https only"}
+            secret: {type: string, writeOnly: true, minLength: 16}
+            secretSet: {type: boolean, readOnly: true}
+            lastError: {type: string, readOnly: true}
+            lastDeliveredAt: {type: string, format: date-time, readOnly: true}
+        threema:
+          type: object
+          required: [enabled, verified]
+          properties:
+            enabled: {type: boolean}
+            id: {type: string, pattern: '^[A-Z0-9]{8}$'}
+            verified: {type: boolean, readOnly: true}
+    DestinationsPatch:
+      type: object
+      description: Same shape as Destinations; omitted fields keep their value, null clears
+      properties:
+        app: {type: object, properties: {titleTemplate: {type: string}, bodyTemplate: {type: string}}}
+        telnet: {type: object, properties: {enabled: {type: boolean}, password: {type: [string, 'null'], minLength: 8}}}
+        url: {type: object, properties: {enabled: {type: boolean}, url: {type: [string, 'null'], format: uri}, secret: {type: [string, 'null'], minLength: 16}}}
+        threema: {type: object, properties: {enabled: {type: boolean}, id: {type: [string, 'null'], pattern: '^[A-Z0-9]{8}$'}}}
+
+    # ---------------------------------------------------------- devices
+    PushSound:
+      type: string
+      enum: [default, blip, morse]
+    DeviceRegistration:
+      type: object
+      required: [platform, pushToken]
+      properties:
+        platform: {type: string, enum: [ios, android, web]}
+        pushToken: {type: string, description: "APNs token, FCM token, or Web Push subscription JSON"}
+        name: {type: string, maxLength: 64}
+        sound: {$ref: '#/components/schemas/PushSound'}
+    Device:
+      type: object
+      required: [id, platform, name, pushEnabled, sound, createdAt]
+      properties:
+        id: {type: string}
+        platform: {type: string, enum: [ios, android, web]}
+        name: {type: string}
+        pushEnabled: {type: boolean}
+        sound: {$ref: '#/components/schemas/PushSound'}
+        createdAt: {type: string, format: date-time}
+        lastSeenAt: {type: string, format: date-time}
+        pushFailing: {type: boolean, description: "Provider rejected the token; re-register"}
+
+    # ---------------------------------------------------------- limits
+    RateLimit:
+      type: object
+      required: [count, intervalSec]
+      properties:
+        count: {type: integer, minimum: 1}
+        intervalSec: {type: integer, minimum: 60, maximum: 86400}
+    LimitsInput:
+      type: object
+      description: Each limit is "at most `count` alerts per `intervalSec`" in its scope; null disables that limit. `total` cannot be disabled and may not exceed 100 alerts per hour (count * 3600 / intervalSec <= 100); otherwise 400.
+      required: [total]
+      properties:
+        total: {$ref: '#/components/schemas/RateLimit'}
+        perCallsign: {oneOf: [{$ref: '#/components/schemas/RateLimit'}, {type: 'null'}]}
+        perCallsignBandMode: {oneOf: [{$ref: '#/components/schemas/RateLimit'}, {type: 'null'}]}
+        perCallsignFrequencyMode: {oneOf: [{$ref: '#/components/schemas/RateLimit'}, {type: 'null'}]}
+        separateSotawatch: {type: boolean, description: "Count SOTAwatch spots in their own bucket, default false"}
+    Limits:
+      allOf:
+        - $ref: '#/components/schemas/LimitsInput'
+        - type: object
+          required: [exceeded]
+          properties:
+            exceeded:
+              type: object
+              readOnly: true
+              required: [count]
+              properties:
+                count: {type: integer, description: "Alerts suppressed since the last reset"}
+                since: {type: string, format: date-time}
+                lastAt: {type: string, format: date-time}
+
+    # ---------------------------------------------------------- triggers
+    TriggerConditions:
+      type: object
+      description: |
+        Every key is optional; a trigger matches when all present conditions hold. List conditions are
+        OR within the list. `not*` lists exclude. Empty lists are rejected. Values are matched after
+        enrichment, so `dxcc` and `band` apply to cluster spots that reported neither.
+      additionalProperties: false
+      properties:
+        source: {type: array, minItems: 1, items: {$ref: './spot-model.yaml#/components/schemas/Source'}}
+        activity: {type: array, minItems: 1, items: {$ref: './spot-model.yaml#/components/schemas/Activity'}, description: "Absent means [on-air]: a trigger never matches qrt or monitoring spots unless it says so"}
+        callsign: {type: array, minItems: 1, maxItems: 5000, items: {$ref: './spot-model.yaml#/components/schemas/Callsign'}, description: "Matches `baseCallsign`"}
+        notCallsign: {type: array, minItems: 1, maxItems: 5000, items: {$ref: './spot-model.yaml#/components/schemas/Callsign'}}
+        fullCallsign: {type: array, minItems: 1, maxItems: 5000, items: {$ref: './spot-model.yaml#/components/schemas/Callsign'}, description: "Matches `callsign` exactly"}
+        notFullCallsign: {type: array, minItems: 1, maxItems: 5000, items: {$ref: './spot-model.yaml#/components/schemas/Callsign'}}
+        prefix: {type: array, minItems: 1, items: {type: string, pattern: '^[A-Z0-9/]{1,8}$'}}
+        notPrefix: {type: array, minItems: 1, items: {type: string, pattern: '^[A-Z0-9/]{1,8}$'}}
+        mode: {type: array, minItems: 1, items: {$ref: './spot-model.yaml#/components/schemas/Mode'}}
+        band: {type: array, minItems: 1, items: {$ref: '#/components/schemas/BandOrGroup'}, description: "Bands or band groups; groups expand to their bands at match time"}
+        bandSlot: {type: array, minItems: 1, maxItems: 5000, items: {$ref: './spot-model.yaml#/components/schemas/BandSlot'}, description: "Unworked DXCC+band pairs. Written by options.clublogUnworked; editable by hand too"}
+        spotter: {type: array, minItems: 1, items: {$ref: './spot-model.yaml#/components/schemas/Callsign'}}
+        notSpotter: {type: array, minItems: 1, items: {$ref: './spot-model.yaml#/components/schemas/Callsign'}}
+        spotterPrefix: {type: array, minItems: 1, items: {type: string}}
+        dxcc: {type: array, minItems: 1, items: {type: integer}, description: "Entity of the operating location"}
+        homeDxcc: {type: array, minItems: 1, items: {type: integer}, description: "Entity of the base callsign"}
+        spotterDxcc: {type: array, minItems: 1, items: {type: integer}}
+        cq: {type: array, minItems: 1, items: {type: integer, minimum: 1, maximum: 40}}
+        spotterCq: {type: array, minItems: 1, items: {type: integer, minimum: 1, maximum: 40}}
+        continent: {type: array, minItems: 1, items: {type: string, enum: [AF, AN, AS, EU, NA, OC, SA]}}
+        spotterContinent: {type: array, minItems: 1, items: {type: string, enum: [AF, AN, AS, EU, NA, OC, SA]}}
+        state: {type: array, minItems: 1, items: {type: string, pattern: '^[A-Z]{2}_[A-Z0-9]{2,3}$'}, description: 'e.g. US_CA, CA_ON'}
+        spotterState: {type: array, minItems: 1, items: {type: string, pattern: '^[A-Z]{2}_[A-Z0-9]{2,3}$'}}
+        qsl: {type: array, minItems: 1, items: {type: string, enum: [lotw, eqsl]}}
+        summitAssociation: {type: array, minItems: 1, items: {type: string}}
+        summitRegion: {type: array, minItems: 1, items: {type: string, pattern: '^[A-Z]{2}$'}, description: "Region code only (e.g. ZH); combine with summitAssociation"}
+        summitRef: {type: array, minItems: 1, maxItems: 5000, items: {$ref: './spot-model.yaml#/components/schemas/SummitCode'}}
+        summitPoints: {$ref: '#/components/schemas/IntRange'}
+        summitActivations: {$ref: '#/components/schemas/IntRange'}
+        parkProgram: {type: array, minItems: 1, items: {type: string, enum: [pota, wwff]}}
+        parkPrefix: {type: array, minItems: 1, items: {type: string}, description: 'e.g. US, K, VK, DLFF'}
+        parkLocation: {type: array, minItems: 1, items: {type: string}, description: 'POTA location code, e.g. US-CA'}
+        parkRef: {type: array, minItems: 1, maxItems: 5000, items: {$ref: './spot-model.yaml#/components/schemas/ParkCode'}}
+        iota: {type: array, minItems: 1, items: {$ref: './spot-model.yaml#/components/schemas/IotaCode'}}
+        snr: {$ref: '#/components/schemas/IntRange', description: "dB; spots without a report do not match"}
+        speed: {$ref: '#/components/schemas/IntRange', description: "WPM or baud as the spot reports it"}
+        timeOfDay: {$ref: '#/components/schemas/TimeOfDayRange'}
+        daysOfWeek: {type: array, minItems: 1, items: {type: integer, minimum: 0, maximum: 6}, description: "0 = Sunday, UTC"}
+        dstarNode: {type: array, minItems: 1, items: {type: string}}
+        dstarReflector: {type: array, minItems: 1, items: {type: string}, description: "Reflector or repeater module, e.g. REF030-C"}
+        dstarGroup: {type: array, minItems: 1, items: {type: string}}
+    TriggerOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        clublogUnworked:
+          type: object
+          description: |
+            Nightly Club Log sync. Rewrites `conditions.bandSlot` with every DXCC+band pair the given
+            callsign has not worked (per `modes`, `status`, `dateFilter`) on the bands listed in
+            `conditions.band`, which is required. Requires a linked Club Log account.
+          required: [callsign]
+          properties:
+            callsign: {$ref: './spot-model.yaml#/components/schemas/Callsign'}
+            modes: {type: string, enum: [all, cw, phone, data], default: all}
+            status: {type: array, items: {type: string, enum: [worked, confirmed, verified]}}
+            dateFilter: {type: string, enum: [all, last12months, thisYear, lastYear], default: all}
+            lastUpdatedAt: {type: string, format: date-time, readOnly: true}
+            slotCount: {type: integer, readOnly: true, description: Size of the current bandSlot list}
+        sotaCompleteAuto:
+          type: boolean
+          default: false
+          description: Keep `conditions.summitRef` in sync with the account's SOTA complete candidates nightly
+    TriggerInput:
+      type: object
+      required: [conditions, actions]
+      properties:
+        comment: {type: string, maxLength: 1000, description: "Shown in alerts as the trigger name"}
+        conditions: {$ref: '#/components/schemas/TriggerConditions'}
+        actions: {type: array, minItems: 1, uniqueItems: true, items: {$ref: './spot-model.yaml#/components/schemas/Action'}}
+        options: {$ref: '#/components/schemas/TriggerOptions'}
+        enabled: {type: boolean, default: true}
+    Trigger:
+      allOf:
+        - $ref: '#/components/schemas/TriggerInput'
+        - type: object
+          required: [id, enabled, createdAt, updatedAt, matchCount]
+          properties:
+            id: {type: string, readOnly: true}
+            createdAt: {type: string, format: date-time, readOnly: true}
+            updatedAt: {type: string, format: date-time, readOnly: true}
+            matchCount: {type: integer, readOnly: true, description: "Matches since creation or last edit"}
+            lastMatchedAt: {type: string, format: date-time, readOnly: true}
+            autoDisabled:
+              type: object
+              readOnly: true
+              description: Present when the server disabled the trigger for matching too much; editing clears it
+              required: [at, reason]
+              properties:
+                at: {type: string, format: date-time}
+                reason: {type: string}
+
+    # ---------------------------------------------------------- mutes
+    MuteInput:
+      type: object
+      required: [callsign, durationMin]
+      properties:
+        callsign: {$ref: './spot-model.yaml#/components/schemas/Callsign', description: "Matched against `baseCallsign`, so muting HB9DQM silences HB9DQM/P too"}
+        band: {$ref: './spot-model.yaml#/components/schemas/Band'}
+        summitRef: {$ref: './spot-model.yaml#/components/schemas/SummitCode'}
+        durationMin: {type: integer, minimum: 1, maximum: 10080}
+    Mute:
+      allOf:
+        - $ref: '#/components/schemas/MuteInput'
+        - type: object
+          required: [id, expiresAt]
+          properties:
+            id: {type: string}
+            expiresAt: {type: string, format: date-time}
+
+    # ---------------------------------------------------------- spots
+    SimulatedSpot:
+      type: object
+      description: A minimal raw spot; enrichment fills the rest exactly as for a real spot
+      required: [callsign]
+      properties:
+        source: {$ref: './spot-model.yaml#/components/schemas/Source'}
+        activity: {$ref: './spot-model.yaml#/components/schemas/Activity'}
+        callsign: {$ref: './spot-model.yaml#/components/schemas/Callsign'}
+        spotter: {$ref: './spot-model.yaml#/components/schemas/Callsign'}
+        frequency: {type: integer, description: "Hz"}
+        mode: {$ref: './spot-model.yaml#/components/schemas/Mode'}
+        modeDetail: {type: string}
+        comment: {type: string}
+        time: {type: string, format: date-time}
+        summitRef: {$ref: './spot-model.yaml#/components/schemas/SummitCode'}
+        parkRefs: {type: array, items: {$ref: './spot-model.yaml#/components/schemas/ParkCode'}}
+        iota: {$ref: './spot-model.yaml#/components/schemas/IotaCode'}
+        snr: {type: integer}
+        speed: {type: integer}
+        dstar: {$ref: './spot-model.yaml#/components/schemas/DstarDetail'}
+    SimulateResult:
+      type: object
+      required: [spot, matched]
+      properties:
+        spot: {$ref: './spot-model.yaml#/components/schemas/Spot', description: "The spot after enrichment, so the client can see the enriched values"}
+        matched:
+          type: array
+          items:
+            type: object
+            required: [triggerId, actions]
+            properties:
+              triggerId: {type: string}
+              comment: {type: string}
+              actions: {type: array, items: {$ref: './spot-model.yaml#/components/schemas/Action'}}
+        nearMisses:
+          type: array
+          description: Enabled triggers that failed exactly one condition, with that condition named
+          items:
+            type: object
+            required: [triggerId, failedCondition]
+            properties:
+              triggerId: {type: string}
+              comment: {type: string}
+              failedCondition: {type: string}
+
+    # ---------------------------------------------------------- reference
+    Vocabularies:
+      type: object
+      required: [bands, bandGroups, modes, sources, actions, continents, defaultAppTemplates]
+      properties:
+        bands: {type: array, items: {type: object, required: [band, fromHz, toHz], properties: {band: {$ref: './spot-model.yaml#/components/schemas/Band'}, fromHz: {type: integer}, toHz: {type: integer}}}}
+        bandGroups: {type: array, items: {type: object, required: [group, bands], properties: {group: {type: string}, bands: {type: array, items: {$ref: './spot-model.yaml#/components/schemas/Band'}}}}}
+        modes: {type: array, items: {type: object, required: [mode], properties: {mode: {$ref: './spot-model.yaml#/components/schemas/Mode'}, label: {type: string}, details: {type: array, items: {type: string}}}}}
+        sources: {type: array, items: {type: object, required: [source, label], properties: {source: {$ref: './spot-model.yaml#/components/schemas/Source'}, label: {type: string}, url: {type: string}}}}
+        actions: {type: array, items: {$ref: './spot-model.yaml#/components/schemas/Action'}}
+        continents: {type: array, items: {type: string}}
+        states: {type: array, items: {type: object, required: [code, name], properties: {code: {type: string}, name: {type: string}}}}
+        defaultAppTemplates: {type: object, required: [titleTemplate, bodyTemplate], properties: {titleTemplate: {type: string}, bodyTemplate: {type: string}}}
+    RegistrationCaptcha:
+      type: object
+      required: [provider, siteKey, apiEndpoint, scriptUrl, wasmUrl, hashwxUrl]
+      properties:
+        provider: {type: string, enum: [cap], description: "Cap (trycap.dev), a self-hosted proof-of-work CAPTCHA."}
+        siteKey: {type: string, description: "Public site key created in the Cap Standalone dashboard."}
+        apiEndpoint: {type: string, format: uri, description: "Value for the widget attribute data-cap-api-endpoint. The site key is already included."}
+        scriptUrl: {type: string, format: uri, description: "Widget script from the Cap asset server (/assets/widget.js). Override with CAPTCHA_WIDGET_URL."}
+        wasmUrl: {type: string, format: uri, description: "Solver WASM. Assign to window.CAP_CUSTOM_WASM_URL before loading scriptUrl."}
+        hashwxUrl: {type: string, format: uri, description: "HashWX WASM. Assign to window.CAP_CUSTOM_HASHWX_URL before loading scriptUrl."}
+    EntityInfo:
+      allOf:
+        - $ref: './spot-model.yaml#/components/schemas/Entity'
+        - type: object
+          properties:
+            prefix: {type: string, description: "Primary prefix"}
+            deleted: {type: boolean}
+    SotaAssociation:
+      type: object
+      required: [code, name, regions]
+      properties:
+        code: {type: string}
+        name: {type: string}
+        regions: {type: array, items: {type: object, required: [code, name], properties: {code: {type: string}, name: {type: string}}}}
+    Summit:
+      allOf:
+        - $ref: './spot-model.yaml#/components/schemas/SummitRef'
+    ParkProgram:
+      type: object
+      required: [program, prefixes]
+      properties:
+        program: {type: string, enum: [pota, wwff]}
+        prefixes: {type: array, items: {type: object, required: [prefix, name], properties: {prefix: {type: string}, name: {type: string}, dxcc: {type: integer}, locations: {type: array, items: {type: object, required: [code, name], properties: {code: {type: string}, name: {type: string}}}}}}}
+    Park:
+      allOf:
+        - $ref: './spot-model.yaml#/components/schemas/ParkRef'
+        - type: object
+          properties:
+            active: {type: boolean}
+            grid: {type: string}
+    IotaGroup:
+      allOf:
+        - $ref: './spot-model.yaml#/components/schemas/IotaRef'
+        - type: object
+          properties:
+            dxcc: {type: array, items: {type: integer}}
+    Stats:
+      type: object
+      required: [days]
+      properties:
+        days:
+          type: array
+          items:
+            type: object
+            required: [date, spots, alerts]
+            properties:
+              date: {type: string, format: date}
+              spots: {type: object, additionalProperties: {type: integer}, description: "Per source"}
+              alerts: {type: object, additionalProperties: {type: integer}, description: "Per action"}
+

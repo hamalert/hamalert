@@ -1,0 +1,177 @@
+openapi: 3.1.0
+info:
+  title: HamAlert spot model
+  version: 0.3.0
+  summary: Schemas shared by producers, enricher, matcher, streams, webhook and the HTTP API.
+  description: |
+    Schema-only document (no paths). The HTTP API in openapi.yaml references these by
+    `$ref: './spot-model.yaml#/components/schemas/<Name>'`. See spot-model.md for the reasoning.
+    Times are RFC 3339 UTC strings; frequencies are integer Hz.
+  license:
+    name: MIT
+    url: https://opensource.org/license/mit
+components:
+  schemas:
+    # ---- scalar types
+    Callsign:
+      type: string
+      pattern: '^[A-Z0-9/-]{2,20}$'
+      description: Upper case; portable suffixes and prefixes allowed
+    SummitCode:
+      type: string
+      pattern: '^[A-Z0-9]{1,8}/[A-Z]{2}-[0-9]{3}$'
+    ParkCode:
+      type: string
+      pattern: '^[A-Z0-9]{1,5}-[0-9]{4,5}$'
+    IotaCode:
+      type: string
+      pattern: '^(AF|AN|AS|EU|NA|OC|SA)-[0-9]{3}$'
+    Band:
+      type: string
+      pattern: '^[0-9.]+(m|cm|mm)(_[a-z0-9]+)?$'
+      description: '160m, 80m, 60m, 40m, 30m, 20m, 17m, 15m, 12m, 11m, 10m, 6m, 4m, 2m, 1.25m, 70cm, 33cm, 23cm, 13cm, 9cm, 6cm, 3cm_qo100, 3cm, 1.25cm, 6mm, 4mm, 2.5mm, 2mm, 1mm (see /reference/vocabularies)'
+    BandSlot:
+      type: string
+      pattern: '^[0-9]{1,3}_[0-9.]+(m|cm)$'
+      description: 'DXCC entity number and band, e.g. 279_20m: the unit Club Log reports as worked or unworked. Derived on every spot that has both entity and band.'
+    Mode:
+      type: string
+      pattern: '^[a-z0-9]+$'
+      description: Normalised mode family (cw, ssb, fm, am, rtty, psk, ft8, ft4, jt, msk, dstar, dmr, c4fm, data, ...). Open vocabulary.
+    Source:
+      type: string
+      description: Open vocabulary; today sotawatch, pota, wwff, cluster, rbn, pskreporter, quadnet, ircddb, dstarusers, amsat, simulator
+    Activity:
+      type: string
+      enum: [on-air, qrt, beacon, monitoring]
+    Action:
+      type: string
+      enum: [app, telnet, url, threema]
+    # ---- spot blocks
+    Entity:
+      type: object
+      required: [dxcc, name]
+      properties:
+        dxcc: {type: integer}
+        name: {type: string}
+        continent: {type: string, enum: [AF, AN, AS, EU, NA, OC, SA]}
+        cq: {type: integer}
+    Spotter:
+      type: object
+      required: [callsign]
+      properties:
+        callsign: {type: string}
+        instance: {type: string, pattern: '^[0-9]{1,2}$', description: 'Skimmer instance suffix, e.g. W1NT-6 → "6"'}
+        entity: {$ref: '#/components/schemas/Entity'}
+        state: {type: string}
+    SummitRef:
+      type: object
+      required: [program, ref, association, region]
+      properties:
+        program: {type: string, enum: [sota]}
+        ref: {$ref: '#/components/schemas/SummitCode'}
+        association: {type: string}
+        region: {type: string}
+        name: {type: string}
+        altitude: {type: integer}
+        points: {type: integer}
+        activationCount: {type: integer}
+        latitude: {type: number}
+        longitude: {type: number}
+    ParkRef:
+      type: object
+      required: [program, ref, prefix]
+      properties:
+        program: {type: string, enum: [pota, wwff]}
+        ref: {$ref: '#/components/schemas/ParkCode'}
+        prefix: {type: string}
+        name: {type: string}
+        locations: {type: array, items: {type: string}}
+        latitude: {type: number}
+        longitude: {type: number}
+    IotaRef:
+      type: object
+      required: [ref]
+      properties:
+        ref: {$ref: '#/components/schemas/IotaCode'}
+        name: {type: string}
+    SignalReport:
+      type: object
+      properties:
+        snr: {type: integer, description: "dB"}
+        speed: {type: integer}
+    DstarDetail:
+      type: object
+      properties:
+        node: {type: string, description: 'Repeater or hotspot with module, e.g. HB9AK-B'}
+        gateway: {type: string}
+        reflector: {type: string, description: 'Reflector or repeater module the node is linked to, e.g. REF030-C'}
+        group: {type: string, description: "QuadNet Smart Group callsign"}
+        groupName: {type: string}
+        duration: {type: number, description: "Transmission length in seconds"}
+        suffix: {type: string, maxLength: 4, description: 'MY suffix (the 4-character field), e.g. "ID51"'}
+    Provenance:
+      type: object
+      description: |
+        Field path → how the value was obtained. Absent means the source reported it.
+        Guessed values: `bandplan`, `comment`, `comment-word`, `comment-regex`, `module-letter`.
+        Derived but reliable: `directory`, `dashboard`, `decode`, `receive-clock`.
+        Omitted when empty. Display information only; triggers never read it.
+        Keys use dotted paths, e.g. `mode`, `parks.0.ref`, `dstar.reflector`.
+      additionalProperties: {type: string, pattern: '^[a-z-]+$'}
+    # ---- spot
+    Spot:
+      type: object
+      required: [id, activity, source, callsign, baseCallsign, time, receivedAt]
+      properties:
+        id: {type: string, description: "Server-assigned, globally unique, time-ordered"}
+        activity: {$ref: '#/components/schemas/Activity'}
+        source: {$ref: '#/components/schemas/Source'}
+        sourceId: {type: string, description: "The source's own id for the spot, when it has one"}
+        client: {type: string, description: 'Client application that posted the spot, when the source carries it'}
+        callsign: {$ref: '#/components/schemas/Callsign', description: "As spotted, whitespace removed"}
+        baseCallsign: {type: string, description: "Prefixes and suffixes stripped"}
+        spotter: {$ref: '#/components/schemas/Spotter'}
+        time: {type: string, format: date-time, description: "When the activity happened, UTC"}
+        receivedAt: {type: string, format: date-time, description: "When HamAlert received it"}
+        frequency: {type: integer, minimum: 1, description: "Hz"}
+        band: {$ref: '#/components/schemas/Band'}
+        bandSlot: {$ref: '#/components/schemas/BandSlot', description: "`<entity.dxcc>_<band>`, present when both are known"}
+        mode: {$ref: '#/components/schemas/Mode'}
+        modeDetail: {type: string, description: 'Specific mode as reported, e.g. FT8, JS8, DMR, YSF'}
+        comment: {type: string}
+        rawText: {type: string, description: "The source line verbatim, only for line-based feeds (cluster, RBN, WWFF telnet, PSK Reporter). Absent for JSON and HTML sources."}
+        entity: {$ref: '#/components/schemas/Entity'}
+        homeEntity: {$ref: '#/components/schemas/Entity'}
+        states: {type: array, items: {type: string, pattern: '^[A-Z]{2}_[A-Z0-9]{2,3}$'}}
+        qsl: {type: array, items: {type: string, enum: [lotw, eqsl]}}
+        summit: {$ref: '#/components/schemas/SummitRef'}
+        parks: {type: array, minItems: 1, items: {$ref: '#/components/schemas/ParkRef'}}
+        iota: {$ref: '#/components/schemas/IotaRef'}
+        signal: {$ref: '#/components/schemas/SignalReport'}
+        dstar: {$ref: '#/components/schemas/DstarDetail'}
+        provenance: {$ref: '#/components/schemas/Provenance'}
+    MatchedSpot:
+      type: object
+      description: One spot that matched one or more of the account's triggers. This is also the webhook body.
+      required: [id, spot, triggers, actions, display]
+      properties:
+        id: {type: string, description: "Matched spot id; the SSE event id and the webhook delivery id"}
+        spot: {$ref: '#/components/schemas/Spot'}
+        triggers:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [id]
+            properties:
+              id: {type: string}
+              comment: {type: string}
+        actions: {type: array, items: {$ref: '#/components/schemas/Action'}, description: "Union of the matched triggers' actions"}
+        display:
+          type: object
+          description: Server-rendered notification text from the account's app templates (default templates in /reference/vocabularies). What push, Threema and Telnet show.
+          required: [title, body]
+          properties:
+            title: {type: string}
+            body: {type: string}
