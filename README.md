@@ -13,7 +13,7 @@ packages/contract   OpenAPI files and the generated TypeScript types
 
 From `hamalert-server`, `npm run local-dev` starts MongoDB on `127.0.0.1:27117`, Redis on `127.0.0.1:6479`, and the spot simulator on port `1983`.
 
-Requires pnpm 12 (`corepack prepare pnpm@12.14.0 --activate`).
+Requires Node.js 24, the current LTS, and pnpm 12 (`corepack prepare pnpm@12.14.0 --activate`).
 
 ```sh
 pnpm install

@@ -4,7 +4,7 @@
   "private": true,
   "description": "HamAlert API and the clients that share its contract.",
   "engines": {
-    "node": ">=20.19.0"
+    "node": ">=24"
   },
   "scripts": {
     "dev": "corepack pnpm --filter @hamalert/api dev",
