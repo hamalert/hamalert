@@ -26,6 +26,8 @@ export interface Config {
     hashKey?: string;
   };
   clublogApiKey?: string;
+  /** Sent as the User-Agent header on all outbound HTTP(S) requests to external APIs. */
+  userAgent: string;
   devLogSecrets: boolean;
   captcha: {
     siteKey?: string;
@@ -69,6 +71,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       hashKey: env.THREEMA_VALIDATION_HASHKEY || undefined,
     },
     clublogApiKey: env.CLUBLOG_API_KEY || undefined,
+    userAgent: env.USER_AGENT || 'HamAlert/1.0 (+https://hamalert.org)',
     devLogSecrets: env.DEV_LOG_SECRETS === '1' || nodeEnv !== 'production',
     captcha: {
       siteKey: env.CAPTCHA_SITE_KEY || undefined,

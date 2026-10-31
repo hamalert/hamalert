@@ -46,7 +46,7 @@ export function registerTriggers(app: FastifyInstance) {
   // GET /v1/triggers/helpers/sota-complete-candidates — summits this callsign activated but has not chased.
   app.get('/triggers/helpers/sota-complete-candidates', {preHandler: app.authenticate}, async (req, reply) => {
     try {
-      const summitRefs = await sotaCompleteCandidates(userOf(req).username);
+      const summitRefs = await sotaCompleteCandidates(userOf(req).username, req.server.deps.config.userAgent);
       return {summitRefs};
     } catch (err) {
       return sendError(reply, badRequest([{field: '/', message: err instanceof Error ? err.message : 'SOTA lookup failed'}]));
@@ -166,16 +166,16 @@ async function unworkedDxcc(deps: {db: any; config: {clublogApiKey?: string}; fe
 let sotaUsers: Record<string, string> | undefined;
 
 /** Activations minus chases, from the public SOTA database. The activator roll is cached. */
-async function sotaCompleteCandidates(callsign: string): Promise<string[]> {
+async function sotaCompleteCandidates(callsign: string, userAgent: string): Promise<string[]> {
   if (!sotaUsers) {
-    const roll = await (await fetch('https://api-db2.sota.org.uk/rolls/activator/-1/0/all/all')).json() as Array<{Callsign: string; UserID: string}>;
+    const roll = await (await fetch('https://api-db2.sota.org.uk/rolls/activator/-1/0/all/all', {headers: {'user-agent': userAgent}})).json() as Array<{Callsign: string; UserID: string}>;
     sotaUsers = {};
     for (const row of roll) sotaUsers[String(row.Callsign).toUpperCase()] = String(row.UserID);
   }
   const userId = sotaUsers[callsign.toUpperCase()];
   if (!userId) return [];
-  const activations = await (await fetch(`https://api-db2.sota.org.uk/logs/activator/${userId}/99999/1`)).json() as Array<{Summit: string}>;
-  const chases = await (await fetch(`https://api-db2.sota.org.uk/logs/chaser/${userId}/99999/1`)).json() as Array<{SummitCode: string}>;
+  const activations = await (await fetch(`https://api-db2.sota.org.uk/logs/activator/${userId}/99999/1`, {headers: {'user-agent': userAgent}})).json() as Array<{Summit: string}>;
+  const chases = await (await fetch(`https://api-db2.sota.org.uk/logs/chaser/${userId}/99999/1`, {headers: {'user-agent': userAgent}})).json() as Array<{SummitCode: string}>;
   const refs = new Set<string>();
   for (const activation of activations || []) {
     const match = /^(\S+)/.exec(activation.Summit || '');
